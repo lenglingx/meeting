@@ -1,0 +1,7 @@
+voicelibrary/
+models_cache/
+storage/uploads/
+storage/temp/
+.env
+__pycache__/
+*.pyc

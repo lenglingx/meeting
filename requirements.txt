@@ -1,0 +1,9 @@
+pydantic_settings
+sqlalchemy
+alembic
+redis
+minio
+celery
+pymysql
+python-multipart
+pydub

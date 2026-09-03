@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>在线会议识别</title>
+<style>body{margin:0;background:#f5f7fa;color:#182230;font:14px/1.5 "Microsoft YaHei",Arial,sans-serif}.wrap{max-width:1000px;margin:auto;padding:28px 18px}.head{margin-bottom:20px}.eyebrow{color:#175cd3;font-size:12px;font-weight:700;letter-spacing:.08em}.head h1{margin:6px 0;font-size:25px}.head p{margin:0;color:#667085}.panel{background:#fff;border:1px solid #e4e7ec;border-radius:8px;padding:20px;margin-bottom:16px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{border:0;border-radius:5px;background:#175cd3;color:#fff;padding:10px 16px;cursor:pointer;font:inherit;font-weight:600}.btn.stop{background:#b42318}.btn:disabled{opacity:.5;cursor:not-allowed}.state{display:inline-flex;align-items:center;gap:7px;color:#667085;font-weight:700}.state:before{content:"";width:8px;height:8px;border-radius:50%;background:#98a2b3}.state.live{color:#b42318}.state.live:before{background:#b42318}.status{padding:10px 12px;background:#f8fafc;border-radius:5px;color:#667085;margin-top:15px}.status.error{background:#fff5f4;color:#b42318}.status.ok{background:#ecfdf3;color:#067647}.meter{height:5px;background:#eef0f3;border-radius:5px;margin-top:16px;overflow:hidden}.meter i{display:block;height:100%;width:0;background:#175cd3;transition:width .2s}.live-text,.meeting-text{background:#101828;color:#f9fafb;border-radius:7px;padding:18px;min-height:140px;white-space:pre-wrap;line-height:1.9;font-size:16px}.meeting-text{background:#fbfcfe;color:#182230;border:1px solid #eef0f3}.events{margin-top:14px;max-height:340px;overflow:auto;border:1px solid #eef0f3;border-radius:6px}.event{display:grid;grid-template-columns:78px 1fr;gap:10px;padding:9px 12px;border-bottom:1px solid #f2f4f7}.event:last-child{border-bottom:0}.event small{color:#98a2b3}.records{border:1px solid #eef0f3;border-radius:6px;overflow:auto;max-height:520px}.record{padding:12px;border-bottom:1px solid #eef0f3}.record:last-child{border-bottom:0}.record-meta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;color:#667085;font-size:12px}.record-speaker{font-weight:700;color:#175cd3}.record-match.ok{color:#067647}.record-match.pending{color:#b54708}.record-text{margin-top:5px;line-height:1.8;white-space:pre-wrap}.empty-records{padding:22px;text-align:center;color:#98a2b3}.hint{color:#667085;font-size:12px;margin-top:10px}@media(max-width:560px){.event{grid-template-columns:1fr}.panel{padding:15px}}</style></head>
+<body><main class="wrap"><header class="head"><div class="eyebrow">MEETING / REALTIME</div><h1>在线会议识别</h1><p>打开麦克风后实时发送 PCM 音频，页面即时显示 partial 和 final 结果；停止后会保存音频并触发后续处理。</p></header><section class="panel"><div class="toolbar"><button class="btn" id="start">开始在线识别</button><button class="btn stop" id="stop" disabled>结束会议</button><span id="state" class="state">未连接</span></div><div class="meter"><i id="meter"></i></div><div id="status" class="status">点击“开始在线识别”并允许浏览器访问麦克风。</div><div class="hint">浏览器音频会自动重采样为 16kHz 单声道 PCM；服务端使用 VAD 判断语音段并进行流式识别。</div></section><section class="panel"><h2>实时文本</h2><div id="text" class="live-text">等待开始...</div></section><section class="panel"><h2>会议文本</h2><div id="meetingText" class="meeting-text">会议开始后，已确认的完整文本会显示在这里。</div></section><section class="panel"><h2>会议记录</h2><div id="records" class="records"><div class="empty-records">等待检测到完整发言段。</div></div></section><section class="panel"><h2>事件记录</h2><div id="events" class="events"></div></section></main>
+<script>
+const $=id=>document.getElementById(id);
+let ws=null,ctx=null,source=null,processor=null,stream=null,active=false,stopping=false;
+let committedText='',partialText='',sampleBuffer=new Float32Array(0),meetingId=null,taskId=null,meetingRecords=[];
+function escapeHtml(value){return String(value||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function add(type,text){const d=document.createElement('div');d.className='event';d.innerHTML=`<small>${escapeHtml(type)}</small><span>${escapeHtml(text)}</span>`;$('events').prepend(d)}
+function setState(t,live=false){$('state').textContent=t;$('state').className='state'+(live?' live':'')}
+function renderText(){ $('text').textContent=partialText||'等待当前语音返回...'; $('meetingText').textContent=committedText||'会议开始后，已确认的完整文本会显示在这里。'; }
+function formatTime(ms){ms=Number(ms||0);return String(Math.floor(ms/60000)).padStart(2,'0')+':'+String(Math.floor(ms/1000)%60).padStart(2,'0')+'.'+String(Math.floor(ms%1000/100))}
+function matchText(status){return ({matched:'已匹配',unknown:'未匹配',ambiguous:'结果不明确',pending:'待匹配',insufficient_audio:'有效音频不足',unavailable:'暂不可用'}[status]||status||'待匹配')}
+function renderRecords(){
+  const box=$('records');
+  if(!meetingRecords.length){box.innerHTML='<div class="empty-records">等待检测到完整发言段。</div>';return;}
+  box.innerHTML=meetingRecords.map(r=>{const s=r.speaker||{};const label=r.speaker_label||s.label||s.name||r.speaker_name||('说话人 '+(r.speaker_id??0));const status=r.speaker_status||s.status||'pending';const score=Number(r.speaker_score??s.score??0),margin=Number(r.speaker_margin??s.margin??0);return `<article class="record"><div class="record-meta"><span class="record-speaker">${escapeHtml(label)}</span><span>${formatTime(r.start_ms)} - ${formatTime(r.end_ms)}</span><span class="record-match ${status==='matched'?'ok':'pending'}">${escapeHtml(matchText(status))}</span>${score?`<span>相似度 ${score.toFixed(4)} · 差值 ${margin.toFixed(4)}</span>`:''}</div><div class="record-text">${escapeHtml(r.text||'')}</div></article>`}).join('');
+}
+function addRecord(d){
+  const r={...d,speaker:d.speaker||{status:'pending'}};
+  const index=meetingRecords.findIndex(x=>x.utterance_id&&x.utterance_id===r.utterance_id);
+  if(index>=0)meetingRecords[index]={...meetingRecords[index],...r};else meetingRecords.push(r);
+  renderRecords();
+}
+async function loadFinalTranscript(){
+  if(!meetingId)return;
+  try{const r=await fetch('/api/v1/meetings/'+encodeURIComponent(meetingId)+'/transcript');if(!r.ok)return;const d=await r.json();const rows=d.segments||[];if(!rows.length)return;const oldRecords=meetingRecords;committedText=rows.map(x=>x.text||'').join('');partialText='';renderText();meetingRecords=rows.map((x,i)=>{const old=oldRecords[i]||{};return {...x,speaker_label:x.department?(x.speaker_name+'（'+x.department+'）'):x.speaker_name||('说话人 '+(x.speaker_id??0)),speaker_status:x.speaker_name?'matched':'unknown',speaker_score:old.speaker_score||0,speaker_margin:old.speaker_margin||0};});renderRecords();$('status').textContent='离线二次识别完成，已切换为最终会议记录。';$('status').className='status ok';}catch(e){add('error','读取最终会议记录失败');}
+}
+function pollTask(id){
+  taskId=id;let tries=0;const timer=setInterval(async()=>{if(++tries>180){clearInterval(timer);return;}try{const r=await fetch('/api/v1/tasks/'+encodeURIComponent(id));const d=await r.json();if(d.status==='succeeded'){clearInterval(timer);await loadFinalTranscript();}else if(['failed','cancelled'].includes(d.status)){clearInterval(timer);$('status').textContent='离线二次识别未完成，当前保留实时会议记录。';$('status').className='status error';}}catch(e){}},2000);
+}
+function resample(input,srcRate,targetRate){
+  if(srcRate===targetRate)return input;
+  const ratio=srcRate/targetRate, length=Math.max(1,Math.round(input.length/ratio));
+  const out=new Float32Array(length);
+  for(let i=0;i<length;i++){const pos=i*ratio, left=Math.floor(pos), right=Math.min(left+1,input.length-1), f=pos-left;out[i]=(input[left]||0)*(1-f)+(input[right]||0)*f;}
+  return out;
+}
+function appendSamples(input){const out=new Float32Array(sampleBuffer.length+input.length);out.set(sampleBuffer);out.set(input,sampleBuffer.length);sampleBuffer=out;}
+function sendPcm(input){
+  if(!ws||ws.readyState!==WebSocket.OPEN)return;
+  const data=new Int16Array(input.length);
+  for(let i=0;i<input.length;i++){const s=Math.max(-1,Math.min(1,input[i]));data[i]=Math.round(s*32767);}
+  ws.send(data.buffer);
+}
+function processAudio(input,srcRate){
+  appendSamples(resample(input,srcRate,16000));
+  const chunkSize=960;
+  while(sampleBuffer.length>=chunkSize){sendPcm(sampleBuffer.slice(0,chunkSize));sampleBuffer=sampleBuffer.slice(chunkSize);}
+  $('meter').style.width=Math.min(100,(Number($('meter').style.width.replace('%',''))||0)+1)+'%';
+}
+function handleMessage(d){
+  if(d.event==='partial'){
+    partialText=d.text||'';renderText();if(d.text)add('partial',d.text);
+  }else if(d.event==='final'){
+    if(d.text)committedText+=(committedText?' ':'')+d.text;partialText='';renderText();addRecord(d);add('final',d.text||'本句结束');
+  }else if(d.event==='offline_processing'){
+    meetingId=d.meeting_id||meetingId;taskId=d.task_id||null;
+    $('status').textContent='实时识别结束，离线二次识别处理中。任务：'+(d.task_id||'未创建');add('offline_processing',d.task_id||'');
+    if(taskId)pollTask(taskId);
+  }else if(d.event==='error'){
+    $('status').textContent=d.message||'实时识别错误';$('status').className='status error';add('error',d.message||'');
+  }else add(d.event,d.message||d.text||'');
+}
+async function start(){
+  if(active)return;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+    const proto=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(`${proto}://${location.host}/api/v1/ws`);ws.binaryType='arraybuffer';stopping=false;
+    ws.onopen=()=>{
+      active=true;setState('正在识别',true);$('start').disabled=true;$('stop').disabled=false;committedText='';partialText='';sampleBuffer=new Float32Array(0);renderText();
+      $('status').textContent='已连接，正在接收麦克风音频。';add('ready','WebSocket 已连接');
+      ws.send(JSON.stringify({chunk_size:[5,10,5],wav_name:'microphone',is_speaking:true,chunk_interval:10,itn:false,mode:'2pass',wav_format:'pcm',audio_fs:16000,hotwords:[]}));
+      ctx=new (window.AudioContext||window.webkitAudioContext)();source=ctx.createMediaStreamSource(stream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>processAudio(e.inputBuffer.getChannelData(0),e.inputBuffer.sampleRate);source.connect(processor);processor.connect(ctx.destination);
+    };
+    ws.onmessage=e=>{try{handleMessage(JSON.parse(e.data));}catch(err){add('error','无法解析服务端消息');}};
+    ws.onerror=()=>{$('status').textContent='WebSocket 连接失败';$('status').className='status error';};
+    ws.onclose=()=>{if(!stopping)cleanup(false);};
+  }catch(e){$('status').textContent='无法启动在线识别：'+e.message;$('status').className='status error';cleanup(false);}
+}
+function cleanup(showClosed){
+  active=false;processor?.disconnect();source?.disconnect();ctx?.close();stream?.getTracks().forEach(t=>t.stop());processor=source=ctx=stream=null;ws=null;$('start').disabled=false;$('stop').disabled=true;setState('未连接');
+  if(showClosed){$('status').textContent='会议已结束，音频已提交后续处理。';$('status').className='status ok';add('closed','会议已结束');}
+}
+function stop(){
+  if(!ws||ws.readyState!==WebSocket.OPEN){cleanup(true);return;}
+  stopping=true;active=false;processor?.disconnect();source?.disconnect();ctx?.close();stream?.getTracks().forEach(t=>t.stop());processor=source=ctx=stream=null;$('stop').disabled=true;setState('正在结束');
+  if(sampleBuffer.length){const padded=new Float32Array(960);padded.set(sampleBuffer);sendPcm(padded);sampleBuffer=new Float32Array(0);}
+  ws.send(JSON.stringify({type:'stop'}));setTimeout(()=>{if(ws){try{ws.close();}catch(e){}cleanup(true);}},1200);
+}
+$('start').onclick=start;$('stop').onclick=stop;
+</script></body></html>
